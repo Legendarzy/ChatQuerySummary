@@ -1,9 +1,8 @@
 import csv
 import numpy as np
-import matplotlib.pyplot as plt
 import re
 import faiss
-from transformers import BertModel, BertTokenizer
+from FlagEmbedding import BGEM3FlagModel,FlagReranker
 from tqdm import tqdm
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -29,24 +28,21 @@ class TextVectorRetrieval:
         # 将文本添加到文本列表中
         self.texts.extend(texts)
         
-    def search(self, query, tokenizer:BertTokenizer,embed_model:BertModel,k=10):
+    def search(self, query, k=10):
         """
         根据查询向量进行检索
         :param query_vector: 查询语句
         :param k: 要返回的最相似结果的数量
         :return: 最相似的文本及其对应的相似度得分
         """
-        query=tokenizer(query,return_tensors='pt')
-        query_vector=embed_model(**query)
         # 转换查询向量为 float32 类型
-        query_vector = np.array([query_vector.last_hidden_state[0,0].tolist()], dtype='float32')
+        query_vector = np.array(query, dtype='float32')
         # 对查询向量进行归一化
         faiss.normalize_L2(query_vector)
         # 在 Faiss 索引中进行搜索
-        print(query_vector.shape)
         distances, indices = self.index.search(query_vector, k)
         # 获取最相似的文本
-        results = [(self.texts[i], distances[0][j]) for j, i in enumerate(indices[0])]
+        results = [self.texts[i] for i in indices[0]]
         return results
 def remove_urls(text):
     url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+|www\.[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+(?:/[^\s]*)?|#:~:text=[^\s]+')
@@ -70,47 +66,54 @@ class dataset:
                         else:
                             # 删去最后的<sep>
                             StrContent.append(temp_str[:-1])
-                            temp_str=""
+                            temp_str=str(row['StrTime'])
             if len(temp_str)>0:
                 StrContent.append(temp_str)
         self.StrContent=StrContent
     def __getitem__(self,id):
         return self.StrContent[self.batchSize*id:self.batchSize*(id+1)]
     def __len__(self):
-        return len(self.StrContent)//self.batchSize+1
+        return len(self.StrContent)//self.batchSize
+class reRanker:
+    def __init__(self):
+        self.reranker = FlagReranker('bge-reranker-v2-m3', use_fp16=True)
+    def reorder(self,list1, list2,k):
+        # 首先将两个列表组合成一个包含元组的列表，每个元组由 list1 和 list2 对应位置的元素组成
+        combined = list(zip(list1, list2))
+        # 对组合后的列表按照 list2 中的元素进行降序排序
+        sorted_combined = sorted(combined, key=lambda x: x[1], reverse=True)
+        # 创建一个空字典用于存储最终结果
+        result = {}
+        # 遍历排序后的组合列表
+        for item1, item2 in sorted_combined[:k]:
+            # 将 list1 中的元素作为键，list2 中对应的元素作为值添加到字典中
+            result[item1] = item2
+        return result
+    def rerank(self,query,answer:list,k):
+        scores = self.reranker.compute_score([[query,p] for p in answer], normalize=True)
+        result=self.reorder(answer,scores,k)
+        return result
 
 
-# 示例使用
 if __name__ == "__main__":
     data=dataset('file.csv')
-    model_name = 'bert-base-chinese'
-    tokenizer = BertTokenizer.from_pretrained(model_name)
-    model=BertModel.from_pretrained('bert-base-chinese')
-    retrieval = TextVectorRetrieval(dim=768)
-
+    model = BGEM3FlagModel('bge_m3',use_fp16=True)
+    retrieval = TextVectorRetrieval(dim=1024)
+    reRanker_model=reRanker()
     for d in tqdm(data):
         if len(d)==0:
             break
-        out = tokenizer(
-            # 传入的两个句子
-            text=d,
-            # 长度大于设置是否截断
-            truncation=True,
-            # 一律补齐，如果长度不够
-            padding='max_length',
-            add_special_tokens=True,
-            return_tensors='pt',
-            max_length=100,
-        )
-        out=model(**out)
-        vector=out.last_hidden_state[:,0].tolist()
-        
+        vector=model.encode(d,max_length=120)['dense_vecs']
         retrieval.add_vectors(d, vector)
+    while 1:
+        # 示例查询向量
+        query = input('输入你想查询的问题\n')
+        query_vector=model.encode([query],max_length=120)['dense_vecs']
+        # 进行检索，返回最相似的 2 个结果
+        results = retrieval.search(query_vector, k=50)
+        result=reRanker_model.rerank(query,results,5)
+        for a in result:
+            print(f'得分:{result[a]}    文本: {a}')
+        
 
-    # 示例查询向量
-    query_vector = '我们平时去哪里吃饭'
-    # 进行检索，返回最相似的 2 个结果
-    results = retrieval.search(query_vector,tokenizer,model, k=5)
-    print("检索结果：")
-    for text, score in results:
-        print(f"文本: {text}, 相似度得分: {score}")
+
